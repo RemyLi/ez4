@@ -18,26 +18,28 @@ $script = eZScript::instance( array( 'description' => ( "\n" .
                                       'use-extensions' => true ) );
 $script->startup();
 
-$scriptOptions = $script->getOptions( "[nodes-id:][ignore-trash][classes:][dry-run]",
+$scriptOptions = $script->getOptions( "[nodes-id:][ignore-trash][classes:][dry-run][disable-indexing]",
                                       "",
                                       array( 'nodes-id' => "Subtree nodes ID (separated by comma ',').",
                                              'ignore-trash' => "Ignore trash ('move to trash' by default).",
                                           'classes' => "classes identifiers of object to delete (separated by comma ',').",
-                                          'dry-run' => "Mode dry-run"
+                                          'dry-run' => "Mode dry-run",
+                                          'disable-indexing' => "disable-indexing",
                                              ),
                                       false );
 $script->initialize();
 $srcNodesID  = $scriptOptions[ 'nodes-id' ] ? trim( $scriptOptions[ 'nodes-id' ] ) : false;
 $moveToTrash = $scriptOptions[ 'ignore-trash' ] ? false : true;
+$disable_indexing = !!$scriptOptions[ 'disable-indexing' ];
 $dryRun      = $scriptOptions[ 'dry-run' ] ? true : false;
 $classes     = $scriptOptions[ 'classes' ] ? trim($scriptOptions[ 'classes' ]) : false;
 $verbose     = $scriptOptions[ 'verbose' ];
 $size        = 200;
+$start       = time();
 
 $deleteIDArray = $srcNodesID ? explode( ',', $srcNodesID ) : false;
 
-if ( !$deleteIDArray )
-{
+if ( !$deleteIDArray ) {
     $cli->error( "Subtree remove Error!\nCannot get subtree nodes. Please check nodes-id argument and try again." );
     $script->showHelp();
     $script->shutdown( 1 );
@@ -46,13 +48,14 @@ if ( !$deleteIDArray )
 $ini = eZINI::instance();
 // Get user's ID who can remove subtrees. (Admin by default with userID = 14)
 $userCreatorID = $ini->variable( "UserSettings", "UserCreatorID" );
+/** @var eZUser $user */
 $user = eZUser::fetch( $userCreatorID );
-if ( !$user )
-{
+if ( !$user ) {
     $cli->error( "Subtree remove Error!\nCannot get user object by userID = '$userCreatorID'.\n(See site.ini[UserSettings].UserCreatorID)" );
     $script->shutdown( 1 );
 }
 eZUser::setCurrentlyLoggedInUser( $user, $userCreatorID );
+$cli->notice( "Logged as ".$user->Login. " userID = '$userCreatorID' (See site.ini[UserSettings].UserCreatorID)" );
 
 $params = array(
     'Depth' => 1,
@@ -62,8 +65,22 @@ $params = array(
 if ($classes) {
     $params['ClassFilterType'] = 'include';
     $params['ClassFilterArray'] = explode(',',$classes);
+    $cli->notice( "Classes filters : " . implode(', ', $params['ClassFilterArray']) );
 }
-$cli->output(var_export($params, true));
+//$cli->output(var_export($params, true));
+
+if ($disable_indexing) {
+    eZINI::instance()->setVariable('ContentSettings', 'ViewCaching', 'disabled');
+    eZINI::instance()->setVariable('ContentSettings', 'StaticCache', 'disabled');
+    eZINI::instance()->setVariable('ContentSettings', 'PreViewCache', 'disabled');
+    eZINI::instance()->setVariable('SearchSettings', 'DelayedIndexing', 'enabled');
+    eZINI::instance('ezfind.ini')->setVariable('IndexOptions', 'OptimizeOnCommit', 'disabled');
+    $cli->notice( "indexing disabled. Don't forget to reindex content." );
+}
+
+if ($dryRun) {
+    $cli->notice( "Don't worry, --dry-run mode activated." );
+}
 
 foreach ( $deleteIDArray as $nodeID )
 {
@@ -75,7 +92,7 @@ foreach ( $deleteIDArray as $nodeID )
         continue;
     }
 
-    $count = eZContentObjectTreeNode::subTreeCountByNodeID($params, $nodeID);
+    $count = (int)eZContentObjectTreeNode::subTreeCountByNodeID($params, $nodeID);
 
     $cli->notice( "===== $nodeID : $count children to remove. ".$node->url() );
 
@@ -89,7 +106,30 @@ foreach ( $deleteIDArray as $nodeID )
 
             $child_node_id = $child->attribute('node_id') ;
             if ($verbose) {
-                $cli->output( "[$i/$count] $child_node_id remove. ".$child->url() );
+                $t = time();
+                $te = max($t-$start, 1); // temps écoulé. (1 min pour éviter les divisions par 0)
+                $tm = ($te/$i); // temps moyen. = temps déjà consomé divisé par le nombre de objet passé. FLoat.
+                $r = $count-$i;
+                $tr = (int)($r * $tm); // temps restant = nombre d'objet restant multiplié par le temp moyen.
+                $tf = $t + $tr; // temps final = temps actuel plus le temps restant
+                $df = date('H:i.s', $tf); // date finalle
+                /*
+                $cli->output(var_export(array(
+                    '$count' => $count,
+                    '$start' => $start,
+                    '$t' => $t,
+                    '$i' => $i,
+                    '$te' => $te,
+                    '$tm' => $tm,
+                    '$r' => $r,
+                    '$tr' => $tr,
+                    '$tf' => $tf,
+                    '$df' => $df,
+                ), true));
+                */
+
+                $i_out = str_pad($i, strlen("$count"));
+                $cli->output( "[$i_out/$count] Remove node id : $child_node_id. estimated end : $df ".$child->url() );
             } else {
                 $cli->output('-', false);
             }
@@ -109,8 +149,10 @@ foreach ( $deleteIDArray as $nodeID )
 //            else
 //                $cli->output( "Successfuly DONE.\n" );
         }
-        $params['offset'] += $size;
-    } while (count($children) > 0);
+        if ($dryRun) { // Si il n'y a pas de dry-run alors la liste des résultats se décale d'elle même.
+            $params['Offset'] += $size; // Avec le dry-run on est obligé de décaler l'indexe car les éléments ne sont pas supprimé.
+        }
+    } while (count($children) > 0 && $i <= $count);
 }
 
 $cli->output( "===== Done." );
